@@ -463,6 +463,12 @@ model UserEpisode {
   /// Denormalised so per-show and per-day queries avoid a join.
   showId    String
   seasonId  String
+  /// Denormalised episode coordinates. Progress maths filters on
+  /// seasonNumber > 0 (specials do not count toward completion) and orders by
+  /// (seasonNumber, episodeNumber) to find where the user is — both would
+  /// otherwise need a join to episodes on the hottest write path in the app.
+  seasonNumber  Int
+  episodeNumber Int
   watchedAt DateTime @default(now())
   /// Calendar date of watchedAt, used for streaks and daily rollups.
   watchedOn DateTime @db.Date
@@ -477,6 +483,7 @@ model UserEpisode {
   @@index([userId, watchedAt(sort: Desc)])
   @@index([userId, watchedOn])
   @@index([userId, seasonId])
+  @@index([userId, showId, seasonNumber, episodeNumber])
   @@map("user_episodes")
 }
 
