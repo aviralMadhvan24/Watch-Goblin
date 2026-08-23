@@ -39,3 +39,11 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# WatchGoblin
+.env
+.env.local
+/public/uploads
+/coverage
+
+/src/generated/prisma

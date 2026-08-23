@@ -1,0 +1,801 @@
+// ---------------------------------------------------------------------------
+// WatchGoblin — PostgreSQL schema
+//
+// Design notes
+//  * Three separate concepts are deliberately kept apart:
+//      Show        — the canonical catalogue entry (shared by everyone)
+//      UserShow    — one user's relationship with a show (status, rating, ...)
+//      UserEpisode — one user's watched-episode facts (the source of truth)
+//    Everything else (progress %, counters, XP, leaderboards) is derived from
+//    those, then cached in denormalised columns so the hot pages never have to
+//    scan a user's whole history.
+//  * Denormalised counters (UserStats, Show.ratingSum, Review.likeCount, ...)
+//    are only ever written by the server-side service layer, inside the same
+//    transaction as the fact that changed them.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ===========================================================================
+// Enums
+// ===========================================================================
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+/// Catalogue split. Anime is modelled as a first-class type rather than a
+/// genre because the product treats "anime completed" and "TV completed" as
+/// separate statistics.
+enum ShowType {
+  ANIME
+  TV
+}
+
+/// Airing status of the show itself (not the user's progress).
+enum AiringStatus {
+  UPCOMING
+  AIRING
+  ENDED
+  CANCELLED
+}
+
+/// A user's relationship with a show.
+enum WatchStatus {
+  PLAN_TO_WATCH
+  WATCHING
+  COMPLETED
+  ON_HOLD
+  DROPPED
+  REWATCHING
+}
+
+enum Visibility {
+  PUBLIC
+  FOLLOWERS
+  PRIVATE
+}
+
+enum CreditKind {
+  STUDIO
+  NETWORK
+}
+
+enum ActivityType {
+  SHOW_ADDED
+  STATUS_CHANGED
+  SHOW_COMPLETED
+  SEASON_COMPLETED
+  EPISODE_WATCHED
+  SHOW_RATED
+  REVIEW_POSTED
+  USER_FOLLOWED
+  ACHIEVEMENT_UNLOCKED
+  LEVEL_UP
+  STREAK_MILESTONE
+}
+
+/// Why XP was granted. Amounts live in src/config/xp.ts, never in the DB, so
+/// the economy can be retuned without a migration.
+enum XpReason {
+  EPISODE_WATCHED
+  SEASON_COMPLETED
+  SHOW_COMPLETED
+  REVIEW_POSTED
+  REVIEW_LIKED
+  DAILY_STREAK
+  ACHIEVEMENT_UNLOCKED
+  PROFILE_COMPLETED
+}
+
+enum AchievementCategory {
+  MILESTONE
+  BINGE
+  STREAK
+  ANIME
+  TV
+  SOCIAL
+  SPECIAL
+}
+
+/// The counter an achievement watches. Adding a new achievement is a data
+/// change (a row) as long as it can be expressed as metric >= threshold.
+enum AchievementMetric {
+  SHOWS_COMPLETED
+  ANIME_COMPLETED
+  TV_COMPLETED
+  EPISODES_WATCHED
+  SEASONS_COMPLETED
+  MINUTES_WATCHED
+  EPISODES_IN_ONE_DAY
+  CURRENT_STREAK
+  LONGEST_STREAK
+  REVIEWS_POSTED
+  REVIEW_LIKES_RECEIVED
+  FOLLOWERS
+  LEVEL
+}
+
+// ===========================================================================
+// Identity & auth
+// ===========================================================================
+
+model User {
+  id           String    @id @default(cuid())
+  /// Always stored lower-cased; uniqueness is therefore case-insensitive.
+  email        String    @unique
+  passwordHash String
+  /// Lower-cased handle used in URLs (/u/:username).
+  username     String    @unique
+  role         Role      @default(USER)
+  isBanned     Boolean   @default(false)
+  bannedAt     DateTime?
+  banReason    String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  profile             Profile?
+  stats               UserStats?
+  streak              WatchStreak?
+  sessions            Session[]
+  passwordResetTokens PasswordResetToken[]
+
+  userShows      UserShow[]
+  userEpisodes   UserEpisode[]
+  dailyWatchLogs DailyWatchLog[]
+
+  reviews     Review[]
+  reviewLikes ReviewLike[]
+  comments    Comment[]
+
+  following Follow[] @relation("follower")
+  followers Follow[] @relation("following")
+
+  blocksMade     Block[] @relation("blocker")
+  blocksReceived Block[] @relation("blocked")
+
+  activities       Activity[] @relation("activityActor")
+  activitiesTarget Activity[] @relation("activityTargetUser")
+
+  achievements   UserAchievement[]
+  xpEvents       XpEvent[]
+  favoriteShows  UserFavoriteShow[]
+  favoriteGenres UserFavoriteGenre[]
+  adminActions   AdminAuditLog[]     @relation("adminActor")
+
+  @@index([createdAt])
+  @@map("users")
+}
+
+model Profile {
+  userId      String  @id
+  displayName String
+  bio         String? @db.VarChar(280)
+  avatarUrl   String?
+  bannerUrl   String?
+  /// Hex accent colour used to tint the profile page.
+  accentColor String  @default("#8b5cf6")
+  /// Who may view the profile at all.
+  visibility Visibility @default(PUBLIC)
+  /// Who may view watch activity (feed, recent episodes, library).
+  activityVisibility Visibility @default(PUBLIC)
+  /// Gen-Z humour copy toggle. On by default, because that is the product.
+  humorEnabled Boolean @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+/// Rolling session store. Only the SHA-256 hash of the session token is
+/// persisted, so a database leak does not hand over live sessions.
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+  userAgent  String?
+  ipAddress  String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+// ===========================================================================
+// Catalogue
+// ===========================================================================
+
+model Show {
+  id            String       @id @default(cuid())
+  slug          String       @unique
+  type          ShowType
+  title         String
+  originalTitle String?
+  synopsis      String?
+  posterUrl     String?
+  backdropUrl   String?
+  airingStatus  AiringStatus @default(ENDED)
+  firstAirDate  DateTime?
+  lastAirDate   DateTime?
+  /// Fallback runtime used when an episode has no runtime of its own.
+  averageRuntimeMinutes Int @default(24)
+  totalSeasons          Int @default(0)
+  totalEpisodes         Int @default(0)
+  originalLanguage      String @default("en")
+  /// Provider popularity score, used to order Discover/Trending.
+  popularity     Float  @default(0)
+  /// External (provider) score on a 0-10 scale, if the provider supplies one.
+  externalRating Float?
+
+  /// Community rating cache. Averages are kept as sum/count so a new rating is
+  /// an O(1) update instead of an aggregate over every UserShow row.
+  ratingSum   Float @default(0)
+  ratingCount Int   @default(0)
+  /// Number of users with this show in their library — powers "Most watched".
+  memberCount Int   @default(0)
+
+  /// Which MetadataProvider produced this row, and its id there. Lets us
+  /// re-sync or de-duplicate without guessing.
+  sourceProvider String  @default("local")
+  sourceId       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  seasons      Season[]
+  episodes     Episode[]
+  genres       ShowGenre[]
+  credits      ShowCredit[]
+  cast         CastMember[]
+  userShows    UserShow[]
+  userEpisodes UserEpisode[]
+  reviews      Review[]
+  activities   Activity[]
+  favoritedBy  UserFavoriteShow[]
+
+  @@unique([sourceProvider, sourceId], name: "show_source_identity")
+  @@index([type, popularity(sort: Desc)])
+  @@index([type, firstAirDate(sort: Desc)])
+  @@index([popularity(sort: Desc)])
+  @@index([title])
+  @@map("shows")
+}
+
+model Season {
+  id           String    @id @default(cuid())
+  showId       String
+  /// 0 is reserved for specials, matching the convention used by TMDB.
+  number       Int
+  title        String?
+  overview     String?
+  posterUrl    String?
+  airDate      DateTime?
+  episodeCount Int       @default(0)
+
+  show         Show          @relation(fields: [showId], references: [id], onDelete: Cascade)
+  episodes     Episode[]
+  userEpisodes UserEpisode[]
+
+  @@unique([showId, number])
+  @@index([showId])
+  @@map("seasons")
+}
+
+model Episode {
+  id       String @id @default(cuid())
+  showId   String
+  seasonId String
+  /// Denormalised from the season so episode lists and progress maths never
+  /// need to join back through seasons.
+  seasonNumber   Int
+  number         Int
+  title          String?
+  overview       String?
+  stillUrl       String?
+  airDate        DateTime?
+  runtimeMinutes Int?
+
+  show   Show   @relation(fields: [showId], references: [id], onDelete: Cascade)
+  season Season @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  userEpisodes UserEpisode[]
+
+  @@unique([seasonId, number])
+  @@index([showId, seasonNumber, number])
+  @@map("episodes")
+}
+
+model Genre {
+  id   String @id @default(cuid())
+  slug String @unique
+  name String
+
+  shows     ShowGenre[]
+  favorites UserFavoriteGenre[]
+
+  @@map("genres")
+}
+
+model ShowGenre {
+  showId  String
+  genreId String
+
+  show  Show  @relation(fields: [showId], references: [id], onDelete: Cascade)
+  genre Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([showId, genreId])
+  @@index([genreId])
+  @@map("show_genres")
+}
+
+/// A studio (anime) or a network (TV).
+model Credit {
+  id   String     @id @default(cuid())
+  slug String     @unique
+  name String
+  kind CreditKind
+
+  shows ShowCredit[]
+
+  @@map("credits")
+}
+
+model ShowCredit {
+  showId   String
+  creditId String
+
+  show   Show   @relation(fields: [showId], references: [id], onDelete: Cascade)
+  credit Credit @relation(fields: [creditId], references: [id], onDelete: Cascade)
+
+  @@id([showId, creditId])
+  @@index([creditId])
+  @@map("show_credits")
+}
+
+model Person {
+  id       String  @id @default(cuid())
+  slug     String  @unique
+  name     String
+  photoUrl String?
+
+  roles CastMember[]
+
+  @@map("people")
+}
+
+model CastMember {
+  id        String  @id @default(cuid())
+  showId    String
+  personId  String
+  character String?
+  /// Billing order; lower sorts first.
+  order     Int     @default(0)
+
+  show   Show   @relation(fields: [showId], references: [id], onDelete: Cascade)
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([showId, personId, character])
+  @@index([showId, order])
+  @@map("cast_members")
+}
+
+// ===========================================================================
+// Tracking
+// ===========================================================================
+
+/// One user's relationship with one show.
+model UserShow {
+  id     String      @id @default(cuid())
+  userId String
+  showId String
+  status WatchStatus @default(PLAN_TO_WATCH)
+
+  /// 0.5 .. 5.0 in half-star steps. Validated in the service layer.
+  rating Float?
+
+  /// Where the user is right now. Maintained by the tracking service from the
+  /// UserEpisode rows — never written directly from the client.
+  currentSeasonNumber  Int @default(0)
+  currentEpisodeNumber Int @default(0)
+
+  /// Denormalised progress caches.
+  episodesWatched  Int @default(0)
+  seasonsCompleted Int @default(0)
+  minutesWatched   Int @default(0)
+
+  rewatchCount Int     @default(0)
+  notes        String? @db.VarChar(500)
+
+  startedAt     DateTime?
+  completedAt   DateTime?
+  lastWatchedAt DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  show Show @relation(fields: [showId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, showId])
+  @@index([userId, status])
+  @@index([userId, lastWatchedAt(sort: Desc)])
+  @@index([userId, updatedAt(sort: Desc)])
+  @@index([showId, status])
+  @@index([showId, rating])
+  @@map("user_shows")
+}
+
+/// The atomic truth: this user watched this episode. Everything upstream is
+/// derived from these rows, so it can always be recomputed.
+model UserEpisode {
+  id        String   @id @default(cuid())
+  userId    String
+  episodeId String
+  /// Denormalised so per-show and per-day queries avoid a join.
+  showId    String
+  seasonId  String
+  watchedAt DateTime @default(now())
+  /// Calendar date of watchedAt, used for streaks and daily rollups.
+  watchedOn DateTime @db.Date
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  episode Episode @relation(fields: [episodeId], references: [id], onDelete: Cascade)
+  show    Show    @relation(fields: [showId], references: [id], onDelete: Cascade)
+  season  Season  @relation(fields: [seasonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, episodeId])
+  @@index([userId, showId])
+  @@index([userId, watchedAt(sort: Desc)])
+  @@index([userId, watchedOn])
+  @@index([userId, seasonId])
+  @@map("user_episodes")
+}
+
+/// Per-day rollup. Powers streaks, "episodes in one day" achievements and the
+/// monthly charts without ever scanning user_episodes.
+model DailyWatchLog {
+  id              String   @id @default(cuid())
+  userId          String
+  date            DateTime @db.Date
+  episodesWatched Int      @default(0)
+  minutesWatched  Int      @default(0)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, date])
+  @@index([userId, date(sort: Desc)])
+  @@map("daily_watch_logs")
+}
+
+model WatchStreak {
+  userId        String    @id
+  current       Int       @default(0)
+  longest       Int       @default(0)
+  lastWatchDate DateTime? @db.Date
+  startedOn     DateTime? @db.Date
+  updatedAt     DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("watch_streaks")
+}
+
+// ===========================================================================
+// Reviews & social
+// ===========================================================================
+
+model Review {
+  id           String    @id @default(cuid())
+  userId       String
+  showId       String
+  rating       Float
+  body         String    @db.VarChar(5000)
+  hasSpoilers  Boolean   @default(false)
+  likeCount    Int       @default(0)
+  commentCount Int       @default(0)
+  /// Soft delete so moderation keeps an audit trail.
+  deletedAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  user       User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  show       Show         @relation(fields: [showId], references: [id], onDelete: Cascade)
+  likes      ReviewLike[]
+  comments   Comment[]
+  activities Activity[]
+
+  @@unique([userId, showId])
+  @@index([showId, createdAt(sort: Desc)])
+  @@index([showId, likeCount(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("reviews")
+}
+
+model ReviewLike {
+  reviewId  String
+  userId    String
+  createdAt DateTime @default(now())
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([reviewId, userId])
+  @@index([userId])
+  @@map("review_likes")
+}
+
+model Comment {
+  id        String    @id @default(cuid())
+  reviewId  String
+  userId    String
+  body      String    @db.VarChar(2000)
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  review Review @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([reviewId, createdAt])
+  @@map("comments")
+}
+
+model Follow {
+  followerId  String
+  followingId String
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("follower", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+  @@index([followingId, createdAt(sort: Desc)])
+  @@index([followerId, createdAt(sort: Desc)])
+  @@map("follows")
+}
+
+model Block {
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+
+  blocker User @relation("blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+
+  @@id([blockerId, blockedId])
+  @@index([blockedId])
+  @@map("blocks")
+}
+
+/// Append-only activity log. Display-only fields (show title, episode number,
+/// ...) live in `payload` so rendering the feed needs no extra joins.
+model Activity {
+  id            String       @id @default(cuid())
+  userId        String
+  type          ActivityType
+  visibility    Visibility   @default(PUBLIC)
+  showId        String?
+  reviewId      String?
+  targetUserId  String?
+  achievementId String?
+  payload       Json         @default("{}")
+  createdAt     DateTime     @default(now())
+
+  user        User         @relation("activityActor", fields: [userId], references: [id], onDelete: Cascade)
+  show        Show?        @relation(fields: [showId], references: [id], onDelete: Cascade)
+  review      Review?      @relation(fields: [reviewId], references: [id], onDelete: SetNull)
+  targetUser  User?        @relation("activityTargetUser", fields: [targetUserId], references: [id], onDelete: Cascade)
+  achievement Achievement? @relation(fields: [achievementId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
+  @@index([showId, createdAt(sort: Desc)])
+  @@map("activities")
+}
+
+// ===========================================================================
+// Gamification
+// ===========================================================================
+
+/// Ranks are data, not code: add a row to add a rank.
+model Rank {
+  id          String @id @default(cuid())
+  slug        String @unique
+  name        String
+  description String
+  icon        String @default("🍿")
+  /// Inclusive lower bound; the highest rank has a null upper bound.
+  minLevel    Int    @unique
+  minXp       Int
+  maxXp       Int?
+  accentColor String @default("#8b5cf6")
+
+  stats UserStats[]
+
+  @@index([minLevel])
+  @@map("ranks")
+}
+
+/// Immutable XP ledger. `dedupeKey` is what stops mark/unmark XP farming: the
+/// key for an episode is stable, so re-marking it can never grant XP twice.
+model XpEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  amount    Int
+  reason    XpReason
+  dedupeKey String
+  payload   Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dedupeKey])
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("xp_events")
+}
+
+model Achievement {
+  id          String              @id @default(cuid())
+  code        String              @unique
+  name        String
+  description String
+  icon        String
+  category    AchievementCategory
+  metric      AchievementMetric
+  /// Unlocked when the user's value for `metric` reaches this threshold.
+  threshold   Int
+  xpReward    Int                 @default(0)
+  isSecret    Boolean             @default(false)
+  sortOrder   Int                 @default(0)
+
+  users      UserAchievement[]
+  activities Activity[]
+
+  @@index([category, sortOrder])
+  @@index([metric])
+  @@map("achievements")
+}
+
+model UserAchievement {
+  userId        String
+  achievementId String
+  unlockedAt    DateTime @default(now())
+  /// Value of the metric at unlock time.
+  valueAtUnlock Int      @default(0)
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  achievement Achievement @relation(fields: [achievementId], references: [id], onDelete: Cascade)
+
+  @@id([userId, achievementId])
+  @@index([userId, unlockedAt(sort: Desc)])
+  @@index([achievementId])
+  @@map("user_achievements")
+}
+
+/// One row per user holding every counter the profile and the leaderboards
+/// need. Written only by the stats service, always inside the transaction that
+/// produced the change. Every leaderboard column is indexed.
+model UserStats {
+  userId String @id
+
+  showsCompleted   Int @default(0)
+  animeCompleted   Int @default(0)
+  tvCompleted      Int @default(0)
+  seasonsCompleted Int @default(0)
+  episodesWatched  Int @default(0)
+  minutesWatched   Int @default(0)
+
+  watching    Int @default(0)
+  planToWatch Int @default(0)
+  onHold      Int @default(0)
+  dropped     Int @default(0)
+  rewatching  Int @default(0)
+
+  reviewsPosted       Int @default(0)
+  reviewLikesReceived Int @default(0)
+  followersCount      Int @default(0)
+  followingCount      Int @default(0)
+
+  xpTotal Int     @default(0)
+  level   Int     @default(1)
+  rankId  String?
+
+  currentStreak Int @default(0)
+  longestStreak Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rank Rank? @relation(fields: [rankId], references: [id], onDelete: SetNull)
+
+  @@index([xpTotal(sort: Desc)])
+  @@index([showsCompleted(sort: Desc)])
+  @@index([episodesWatched(sort: Desc)])
+  @@index([minutesWatched(sort: Desc)])
+  @@index([animeCompleted(sort: Desc)])
+  @@index([tvCompleted(sort: Desc)])
+  @@index([longestStreak(sort: Desc)])
+  @@index([currentStreak(sort: Desc)])
+  @@map("user_stats")
+}
+
+// ===========================================================================
+// Personalisation
+// ===========================================================================
+
+model UserFavoriteShow {
+  userId    String
+  showId    String
+  /// Ordering slot within the favourites shelf.
+  slot      Int
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  show Show @relation(fields: [showId], references: [id], onDelete: Cascade)
+
+  @@id([userId, showId])
+  @@unique([userId, slot])
+  @@index([showId])
+  @@map("user_favorite_shows")
+}
+
+model UserFavoriteGenre {
+  userId  String
+  genreId String
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  genre Genre @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([userId, genreId])
+  @@index([genreId])
+  @@map("user_favorite_genres")
+}
+
+// ===========================================================================
+// Admin
+// ===========================================================================
+
+model AdminAuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  action     String
+  targetType String
+  targetId   String
+  payload    Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  actor User @relation("adminActor", fields: [actorId], references: [id], onDelete: Cascade)
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+  @@map("admin_audit_logs")
+}
