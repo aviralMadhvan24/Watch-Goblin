@@ -16,13 +16,29 @@ export function levelToXp(level: number): number {
   return Math.round(LEVEL_CURVE.BASE * Math.pow(clamped - 1, LEVEL_CURVE.EXPONENT));
 }
 
-/** The level a given XP total corresponds to. */
+/**
+ * The level a given XP total corresponds to.
+ *
+ * The closed-form inverse gets within one level, but it inverts the *raw*
+ * curve while `levelToXp` publishes a **rounded** threshold — and the rounding
+ * moves the boundary by up to half an XP in either direction. On 46 of the 99
+ * levels that was enough to disagree: a user holding exactly `levelToXp(4)`
+ * was still reported as level 3, with the progress bar showing zero XP
+ * remaining and refusing to tick over.
+ *
+ * So the analytic result is treated as a seed and reconciled against the
+ * published thresholds, which are the numbers the UI shows and therefore the
+ * ones that define the answer. At most one step is ever needed, so this stays
+ * O(1) — no loop over a threshold table.
+ */
 export function xpToLevel(xp: number): number {
   if (!Number.isFinite(xp) || xp <= 0) return 1;
   const raw = Math.pow(xp / LEVEL_CURVE.BASE, 1 / LEVEL_CURVE.EXPONENT) + 1;
-  // Guard against float drift landing a hair under an exact threshold.
-  const level = Math.floor(raw + 1e-9);
-  return Math.min(Math.max(level, 1), LEVEL_CURVE.MAX_LEVEL);
+  const seed = Math.min(Math.max(Math.floor(raw + 1e-9), 1), LEVEL_CURVE.MAX_LEVEL);
+
+  if (seed < LEVEL_CURVE.MAX_LEVEL && xp >= levelToXp(seed + 1)) return seed + 1;
+  if (seed > 1 && xp < levelToXp(seed)) return seed - 1;
+  return seed;
 }
 
 export interface LevelProgress {

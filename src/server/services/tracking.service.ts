@@ -6,6 +6,7 @@ import type { WatchStatus } from "@/generated/prisma/enums";
 import { toWatchDate } from "@/lib/dates";
 import { errors } from "@/lib/errors";
 import { logger } from "@/lib/logger";
+import { enforceRateLimit } from "@/lib/rate-limit";
 import { activityService } from "@/server/services/activity.service";
 import { achievementsService, type UnlockedAchievement } from "@/server/services/achievements.service";
 import { statsService, type StatDelta } from "@/server/services/stats.service";
@@ -40,12 +41,23 @@ export interface ProgressSnapshot {
   status: WatchStatus;
   episodesWatched: number;
   seasonsCompleted: number;
+  /**
+   * Change in completed-season count since before this update. The absolute
+   * number above is a fact about the user-show; this is what the aggregate
+   * counter on `user_stats` must be moved by.
+   */
+  seasonsCompletedDelta: number;
   currentSeasonNumber: number;
   currentEpisodeNumber: number;
   progress: number;
   /** True only on the transition into COMPLETED, so rewards fire once. */
   justCompletedShow: boolean;
-  newlyCompletedSeasonIds: string[];
+  /**
+   * Every season currently complete — not only the ones completed by this
+   * change. Safe as an XP input because season awards dedupe on season id;
+   * NOT safe as a counter delta, which is what `seasonsCompletedDelta` is for.
+   */
+  completedSeasonIds: string[];
 }
 
 export interface TrackingOutcome {
@@ -90,6 +102,8 @@ export const trackingService = {
       rating?: number | null;
     } = {},
   ): Promise<TrackingOutcome> {
+    await enforceRateLimit("updateLibrary", `user:${userId}`);
+
     const status = input.status ?? "PLAN_TO_WATCH";
 
     if (input.rating !== null && input.rating !== undefined && !isValidRating(input.rating)) {
@@ -111,7 +125,7 @@ export const trackingService = {
 
         const isNew = !existing;
 
-        const userShow = await tx.userShow.upsert({
+        await tx.userShow.upsert({
           where: { userId_showId: { userId, showId } },
           create: {
             userId,
@@ -171,10 +185,20 @@ export const trackingService = {
   },
 
   async removeFromLibrary(userId: string, showId: string): Promise<void> {
+    await enforceRateLimit("updateLibrary", `user:${userId}`);
+
     await db.$transaction(async (tx) => {
       const existing = await tx.userShow.findUnique({
         where: { userId_showId: { userId, showId } },
-        select: { status: true, show: { select: { type: true } } },
+        select: {
+          status: true,
+          // Read before the delete, because these are what the aggregate
+          // counters on `user_stats` have to be reversed by.
+          episodesWatched: true,
+          minutesWatched: true,
+          seasonsCompleted: true,
+          show: { select: { type: true } },
+        },
       });
       if (!existing) return;
 
@@ -187,6 +211,18 @@ export const trackingService = {
       });
 
       await this.reconcileStatusCounters(tx, userId, existing.status, null, existing.show.type, false);
+
+      // The status counters above are only half the job: the volume counters
+      // are aggregates over rows that no longer exist. Without this, removing a
+      // show kept every episode, minute and completed season it contributed —
+      // permanently, and on indexed leaderboard columns. Watch a thousand-episode
+      // series, remove it, keep the total.
+      await statsService.applyDelta(tx, userId, {
+        episodesWatched: -existing.episodesWatched,
+        minutesWatched: -existing.minutesWatched,
+        seasonsCompleted: -existing.seasonsCompleted,
+      });
+
       // Removing a show can empty days, so the streak is rebuilt from scratch.
       await streakService.recompute(tx, userId);
     });
@@ -204,6 +240,8 @@ export const trackingService = {
     if (rating !== null && !isValidRating(rating)) {
       throw errors.validation("Ratings go from 0.5 to 5 stars, in halves.");
     }
+
+    await enforceRateLimit("updateLibrary", `user:${userId}`);
 
     await db.$transaction(async (tx) => {
       const existing = await tx.userShow.findUnique({
@@ -262,6 +300,8 @@ export const trackingService = {
     episodeId: string,
     options: { at?: Date } = {},
   ): Promise<TrackingOutcome> {
+    await enforceRateLimit("trackEpisode", `user:${userId}`);
+
     const at = options.at ?? new Date();
 
     return db.$transaction(
@@ -353,6 +393,8 @@ export const trackingService = {
    * pointless rather than profitable.
    */
   async unmarkEpisodeWatched(userId: string, episodeId: string): Promise<TrackingOutcome> {
+    await enforceRateLimit("trackEpisode", `user:${userId}`);
+
     return db.$transaction(
       async (tx) => {
         const existing = await tx.userEpisode.findUnique({
@@ -404,6 +446,8 @@ export const trackingService = {
         await statsService.applyDelta(tx, userId, {
           episodesWatched: -1,
           minutesWatched: -(episode.runtimeMinutes ?? episode.show.averageRuntimeMinutes),
+          // Negative when this episode was the one completing its season.
+          seasonsCompleted: progress.seasonsCompletedDelta,
         });
 
         return {
@@ -425,6 +469,8 @@ export const trackingService = {
 
   /** Marks every episode of a season watched in one go. */
   async markSeasonWatched(userId: string, seasonId: string): Promise<TrackingOutcome> {
+    await enforceRateLimit("trackEpisode", `user:${userId}`);
+
     return db.$transaction(
       async (tx) => {
         const season = await tx.season.findUnique({
@@ -509,6 +555,8 @@ export const trackingService = {
     seasonNumber: number,
     episodeNumber: number,
   ): Promise<TrackingOutcome> {
+    await enforceRateLimit("trackEpisode", `user:${userId}`);
+
     return db.$transaction(
       async (tx) => {
         const show = await tx.show.findUnique({
@@ -825,11 +873,14 @@ export const trackingService = {
       status,
       episodesWatched,
       seasonsCompleted: completedSeasonIds.length,
+      // `userShow` was read before the update above, so this is genuinely the
+      // difference. Negative when un-marking breaks a season back open.
+      seasonsCompletedDelta: completedSeasonIds.length - userShow.seasonsCompleted,
       currentSeasonNumber: position?.seasonNumber ?? 0,
       currentEpisodeNumber: position?.episodeNumber ?? 0,
       progress: show.totalEpisodes > 0 ? Math.min(1, episodesWatched / show.totalEpisodes) : 0,
       justCompletedShow,
-      newlyCompletedSeasonIds: completedSeasonIds,
+      completedSeasonIds,
     };
   },
 
@@ -888,7 +939,7 @@ export const trackingService = {
       }
     }
 
-    for (const seasonId of progress.newlyCompletedSeasonIds) {
+    for (const seasonId of progress.completedSeasonIds) {
       awards.push({ reason: "SEASON_COMPLETED", dedupeKey: xpDedupeKey.season(seasonId) });
     }
 
@@ -910,7 +961,7 @@ export const trackingService = {
       await statsService.applyDelta(tx, userId, {
         episodesWatched: newEpisodes,
         minutesWatched: options.minutes ?? 0,
-        seasonsCompleted: progress.newlyCompletedSeasonIds.length,
+        seasonsCompleted: progress.seasonsCompletedDelta,
       });
     }
 

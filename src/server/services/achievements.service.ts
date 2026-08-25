@@ -122,19 +122,22 @@ export const achievementsService = {
       if (newlyQualified.length === 0) break;
 
       for (const achievement of newlyQualified) {
-        try {
-          await tx.userAchievement.create({
-            data: {
+        // ON CONFLICT DO NOTHING rather than create-and-catch: a unique
+        // violation inside a Postgres transaction aborts the whole transaction,
+        // and catching it in JS does not un-abort it — every later query on
+        // `tx` would fail with 25P02. count 0 means someone else unlocked it
+        // first, which is not an error.
+        const claimed = await tx.userAchievement.createMany({
+          data: [
+            {
               userId,
               achievementId: achievement.id,
               valueAtUnlock: metrics[achievement.metric],
             },
-          });
-        } catch (error) {
-          // Unique violation: another concurrent write unlocked it first.
-          if (isUniqueViolation(error)) continue;
-          throw error;
-        }
+          ],
+          skipDuplicates: true,
+        });
+        if (claimed.count === 0) continue;
 
         if (achievement.xpReward > 0) {
           await xpService.award(
@@ -222,11 +225,3 @@ export const achievementsService = {
   },
 };
 
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2002"
-  );
-}

@@ -140,13 +140,25 @@ class LocalStorageProvider implements StorageProvider {
  * rather than a dependency the MVP does not need — `env` already validates the
  * credentials when this provider is selected.
  */
+/**
+ * Placeholder for an S3-compatible transport.
+ *
+ * Throws from the constructor rather than from `put`, because the factory below
+ * runs at module load: `STORAGE_PROVIDER=s3` therefore takes the process down
+ * at boot instead of letting it pass the health check and fail on the first
+ * avatar someone uploads.
+ */
 class S3StorageProvider implements StorageProvider {
   readonly name = "s3";
 
-  async put(): Promise<StoredObject> {
+  constructor() {
     throw new Error(
-      "S3 storage is not implemented yet. Install @aws-sdk/client-s3 and implement put()/delete() here; nothing outside this file needs to change.",
+      "STORAGE_PROVIDER=s3 is not implemented yet. Install @aws-sdk/client-s3 and implement put()/delete() here; nothing outside this file needs to change.",
     );
+  }
+
+  async put(): Promise<StoredObject> {
+    throw new Error("S3 storage is not implemented yet.");
   }
 
   async delete(): Promise<void> {
@@ -165,7 +177,6 @@ function createStorageProvider(): StorageProvider {
 }
 
 declare global {
-  // eslint-disable-next-line no-var
   var __watchgoblinStorage: StorageProvider | undefined;
 }
 

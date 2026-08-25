@@ -1,0 +1,36 @@
+# Keeps the build context small and, more importantly, keeps secrets and host
+# state out of the image. Everything here is either rebuilt inside the image or
+# must never be in it.
+
+.git
+.github
+node_modules
+.next
+out
+build
+coverage
+
+# Secrets. `.env*` is gitignored too; this is the second lock on the same door,
+# because a build context is not a git checkout.
+.env
+.env.*
+!.env.example
+
+# Host-local state that would otherwise be baked in as though it were shipped
+# content.
+public/uploads
+
+# Test and tooling surface that never runs in production.
+tests
+vitest.config.mts
+vitest.integration.config.mts
+*.tsbuildinfo
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.prod.yml
+nginx
+README.md
+AGENTS.md
+CLAUDE.md
+.claude

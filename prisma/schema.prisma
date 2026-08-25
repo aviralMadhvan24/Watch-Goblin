@@ -806,3 +806,26 @@ model AdminAuditLog {
   @@index([targetType, targetId])
   @@map("admin_audit_logs")
 }
+
+// ===========================================================================
+// Infrastructure
+// ===========================================================================
+
+/// Shared fixed-window rate-limit counters, used by `RATE_LIMIT_DRIVER=postgres`.
+///
+/// The default `memory` driver is per-process, so every instance behind a load
+/// balancer gets its own budget and the effective limit multiplies by the fleet
+/// size. This table is the shared alternative: it costs one upsert per checked
+/// request and needs no infrastructure beyond the database already in use.
+///
+/// Rows are disposable. Truncating this table forgives every open window and
+/// breaks nothing.
+model RateLimitWindow {
+  /// "<rule>:<identity>", e.g. "login:ip:203.0.113.4".
+  key     String   @id
+  count   Int      @default(0)
+  resetAt DateTime
+
+  @@index([resetAt])
+  @@map("rate_limit_windows")
+}

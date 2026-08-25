@@ -10,6 +10,23 @@ import { z } from "zod";
  * module is `server-only` so it can never be pulled into a client bundle.
  */
 
+/**
+ * True while `next build` is compiling.
+ *
+ * `next build` runs with NODE_ENV=production and imports the app to collect
+ * route data, so every production-only rule below would otherwise fire on a
+ * developer's machine — and the only way past it would be to feed the build
+ * fake credentials for services it never contacts. These rules exist to stop a
+ * *serving* process from starting misconfigured; a compile is not that.
+ *
+ * Next sets this itself (see PHASE_PRODUCTION_BUILD in next/dist), so it cannot
+ * be used to slip past the checks at runtime without deliberately forging it.
+ */
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+
+/** A production rule only applies to a process that is about to serve traffic. */
+const servingInProduction = (nodeEnv: string) => nodeEnv === "production" && !isBuildPhase;
+
 const booleanish = z
   .union([z.boolean(), z.enum(["true", "false", "1", "0"])])
   .transform((v) => v === true || v === "true" || v === "1");
@@ -46,7 +63,7 @@ const schema = z
     EMAIL_FROM: z.string().default("WatchGoblin <no-reply@watchgoblin.test>"),
     SMTP_URL: z.string().optional(),
 
-    RATE_LIMIT_DRIVER: z.enum(["memory"]).default("memory"),
+    RATE_LIMIT_DRIVER: z.enum(["memory", "postgres"]).default("memory"),
     /** Escape hatch for load tests and seeding; never set this in production. */
     RATE_LIMIT_DISABLED: booleanish.default(false),
   })
@@ -68,6 +85,22 @@ const schema = z
   .refine((v) => v.EMAIL_PROVIDER !== "smtp" || !!v.SMTP_URL, {
     message: "SMTP_URL is required when EMAIL_PROVIDER=smtp",
     path: ["SMTP_URL"],
+  })
+  // The rules below are production-only, and they are errors rather than
+  // warnings on purpose. Each describes a configuration that boots cleanly,
+  // passes the health check and then quietly fails a user: a password reset
+  // that goes to the server log instead of an inbox, or a rate limiter that is
+  // switched off. A process that will not start is a far cheaper failure than
+  // one that looks healthy while doing the wrong thing.
+  .refine((v) => !servingInProduction(v.NODE_ENV) || v.EMAIL_PROVIDER !== "console", {
+    message:
+      "EMAIL_PROVIDER=console cannot be used in production — password resets would be written to the log instead of delivered. Set EMAIL_PROVIDER=smtp and SMTP_URL.",
+    path: ["EMAIL_PROVIDER"],
+  })
+  .refine((v) => !servingInProduction(v.NODE_ENV) || !v.RATE_LIMIT_DISABLED, {
+    message:
+      "RATE_LIMIT_DISABLED cannot be set in production — it turns off login throttling and provider-quota protection.",
+    path: ["RATE_LIMIT_DISABLED"],
   });
 
 function load() {

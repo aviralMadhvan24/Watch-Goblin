@@ -14,11 +14,14 @@ import { statsService } from "@/server/services/stats.service";
  *
  *  - Every award is an immutable row in `xp_events` with a caller-supplied
  *    `dedupeKey`, and the table has a unique index on (userId, dedupeKey).
- *  - The insert is attempted first. If it violates the unique index, this
+ *  - The insert goes in as ON CONFLICT DO NOTHING. If it inserts nothing, this
  *    action has already paid out and we return `{ awarded: false }` without
  *    touching any counter. That check is the database's, not the
  *    application's, so it holds under concurrency too — two simultaneous marks
- *    of the same episode cannot both win.
+ *    of the same episode cannot both win. It must stay a conflict-tolerant
+ *    insert rather than a `create` in a try/catch: a raised unique violation
+ *    aborts the surrounding Postgres transaction, and no amount of catching in
+ *    JS brings it back.
  *  - XP is never revoked. Un-marking an episode rolls back the *progress*
  *    counters, but the ledger row stays. Combined with the stable dedupe key,
  *    that removes any reason to toggle: the first mark is the only one that
@@ -37,15 +40,6 @@ export interface XpAwardResult {
   leveledUp: boolean;
 }
 
-/** Postgres unique-violation code, surfaced by Prisma as P2002. */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    (error as { code?: string }).code === "P2002"
-  );
-}
 
 export const xpService = {
   /**
@@ -79,30 +73,39 @@ export const xpService = {
       };
     }
 
-    try {
-      await tx.xpEvent.create({
-        data: {
+    // `createMany({ skipDuplicates })` compiles to ON CONFLICT DO NOTHING, so a
+    // repeat award is a no-op that returns count 0 rather than an error.
+    //
+    // This must not be a `create` in a try/catch. In Postgres a failed statement
+    // aborts the whole transaction: catching the unique violation in JS does not
+    // un-abort it, and every later query on `tx` then dies with 25P02
+    // ("current transaction is aborted"). Since the dedupe key is *designed* to
+    // collide — re-marking an episode whose XP was already paid is the normal
+    // case — that turned an expected no-op into a failed write.
+    const created = await tx.xpEvent.createMany({
+      data: [
+        {
           userId,
           amount,
           reason,
           dedupeKey,
           payload: (options?.payload ?? {}) as never,
         },
-      });
-    } catch (error) {
-      if (isUniqueViolation(error)) {
-        // Already paid out for this exact action. Not an error — the expected
-        // outcome of re-marking something.
-        return {
-          awarded: false,
-          amount: 0,
-          xpTotal: previousXp,
-          previousLevel,
-          level: previousLevel,
-          leveledUp: false,
-        };
-      }
-      throw error;
+      ],
+      skipDuplicates: true,
+    });
+
+    if (created.count === 0) {
+      // Already paid out for this exact action. Not an error — the expected
+      // outcome of re-marking something.
+      return {
+        awarded: false,
+        amount: 0,
+        xpTotal: previousXp,
+        previousLevel,
+        level: previousLevel,
+        leveledUp: false,
+      };
     }
 
     const updated = await tx.userStats.update({

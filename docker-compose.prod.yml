@@ -1,0 +1,120 @@
+# Production-shaped stack: two app instances behind nginx, one Postgres.
+#
+#   docker compose --env-file .env.docker -f docker-compose.prod.yml up -d --build
+#
+# Two instances rather than one on purpose. Everything that breaks when an app
+# is scaled horizontally breaks at exactly two: in-process rate limits stop
+# being limits, on-disk uploads stop being visible to half the requests, and
+# sticky assumptions about local state surface immediately. Running the pair
+# locally is the cheapest way to find those before a deploy does.
+#
+# Migrations are a separate one-shot service that the app instances wait for,
+# so a schema change is applied exactly once per deploy rather than raced by
+# every replica on boot.
+
+name: watchgoblin
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # Deliberately not published to the host: nothing outside this network needs
+    # to reach the database, and the dev instance already owns port 5442.
+
+  # Local SMTP sink. Catches every message and shows it at http://localhost:8025
+  # instead of delivering it. This is what lets the stack run with
+  # EMAIL_PROVIDER=smtp — which production requires — without sending real mail.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+  # One-shot. Runs to completion before the app instances start, and exits.
+  migrate:
+    build:
+      context: .
+      # A separate image from the app: the Prisma CLI needs its full dependency
+      # tree, which the standalone runtime deliberately does not carry. See the
+      # `migrator` stage in the Dockerfile.
+      target: migrator
+    restart: "no"
+    environment:
+      # The only variable a migration needs: `prisma.config.ts` reads
+      # DATABASE_URL straight from the environment and never imports the app.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app1:
+    build:
+      context: .
+      # Named explicitly rather than relying on `runner` being the last stage —
+      # adding a stage below it would otherwise silently change what runs here.
+      target: runner
+    restart: unless-stopped
+    environment: &app_env
+      NODE_ENV: production
+      APP_URL: ${APP_URL}
+      NEXT_PUBLIC_APP_URL: ${APP_URL}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      AUTH_SECRET: ${AUTH_SECRET}
+      AUTH_SESSION_TTL_DAYS: ${AUTH_SESSION_TTL_DAYS}
+      METADATA_PROVIDER: ${METADATA_PROVIDER}
+      TMDB_API_KEY: ${TMDB_API_KEY}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER}
+      EMAIL_FROM: ${EMAIL_FROM}
+      SMTP_URL: ${SMTP_URL}
+      # The whole reason this file runs two instances. With the default
+      # in-process driver each container keeps its own counters, so every limit
+      # would be worth double here and worth N times as much in a real fleet.
+      RATE_LIMIT_DRIVER: postgres
+      INSTANCE_ID: app1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  app2:
+    build:
+      context: .
+      target: runner
+    restart: unless-stopped
+    environment:
+      <<: *app_env
+      INSTANCE_ID: app2
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app1
+      - app2
+
+volumes:
+  pgdata:
