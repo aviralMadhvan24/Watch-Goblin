@@ -42,7 +42,7 @@ export default async function DiscoverPage({ searchParams }: PageProps<"/discove
   const sort = pick<ShowSort>(one(params.sort), SORTS) ?? "popular";
   const page = Math.max(1, Number(one(params.page) ?? 1) || 1);
 
-  const [{ shows, total, pageCount }, genres] = await Promise.all([
+  const [{ shows, total, pageCount, didYouMean }, genres] = await Promise.all([
     discoverShows({ q, type, genre, airingStatus, sort, page }),
     listGenres(),
   ]);
@@ -75,6 +75,17 @@ export default async function DiscoverPage({ searchParams }: PageProps<"/discove
         genres={genres}
         current={{ q, type, genre, airing: airingStatus, sort }}
       />
+
+      {/* Said out loud rather than quietly substituted: these rows are answers
+          to a question the user did not quite ask, and presenting them as an
+          exact match is how a search box loses trust. */}
+      {didYouMean ? (
+        <p className="mt-6 rounded-card border border-line bg-surface-raised px-4 py-3 text-sm text-ink-muted">
+          Nothing matched <span className="font-medium text-ink">{q}</span> exactly. Showing the
+          closest titles — did you mean{" "}
+          <span className="font-medium text-ink">{didYouMean}</span>?
+        </p>
+      ) : null}
 
       {shows.length === 0 ? (
         q ? null : (

@@ -1,8 +1,10 @@
+import { Suspense } from "react";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { Clapperboard, Flame, Trophy, Tv } from "lucide-react";
 
 import { ContinueWatchingRow } from "@/app/(app)/dashboard/continue-watching";
+import { RecommendedForYou, RecommendedSkeleton } from "@/app/(app)/dashboard/recommended";
 import { EmptyState } from "@/components/shared/empty-state";
 import { SectionHeader, StatRow, StatTile } from "@/components/shared/stat-tile";
 import { ActivityFeed } from "@/components/feed/activity-feed";
@@ -129,6 +131,22 @@ export default async function DashboardPage() {
         ) : (
           <ContinueWatchingRow entries={continueWatching} humor={humor} />
         )}
+      </section>
+
+      {/* Streamed: scoring the catalogue is several queries, and nothing above
+          this point should wait on it. */}
+      <section>
+        <SectionHeader
+          title="Recommended for you"
+          action={
+            <Link href="/discover" className="text-sm text-ink-muted hover:text-primary">
+              Browse all →
+            </Link>
+          }
+        />
+        <Suspense fallback={<RecommendedSkeleton />}>
+          <RecommendedForYou userId={user.id} />
+        </Suspense>
       </section>
 
       <section>

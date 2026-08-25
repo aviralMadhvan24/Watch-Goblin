@@ -1,8 +1,10 @@
+import { Suspense } from "react";
 import type { Metadata } from "next";
 import Image from "next/image";
 import { notFound, redirect } from "next/navigation";
 import { Calendar, Clapperboard, Star, Users } from "lucide-react";
 
+import { SimilarShows, SimilarShowsSkeleton } from "@/app/(app)/shows/[slug]/similar";
 import { EpisodeList } from "@/components/shows/episode-list";
 import { SimpleEmpty } from "@/components/shared/empty-state";
 import { Poster } from "@/components/shows/poster";
@@ -314,6 +316,13 @@ export default async function ShowPage({ params }: PageProps<"/shows/[slug]">) {
             ) : null}
           </aside>
         </div>
+
+        {/* Streamed in its own boundary: the synopsis, episode list and track
+            controls above are the page, and none of them should wait on a
+            sidebar of related titles. */}
+        <Suspense fallback={<SimilarShowsSkeleton />}>
+          <SimilarShows showId={show.id} type={show.type} />
+        </Suspense>
       </div>
     </article>
   );

@@ -3,6 +3,7 @@ import "server-only";
 import { db } from "@/db/client";
 import type { AiringStatus, ShowType } from "@/generated/prisma/enums";
 import { normalizeLimit } from "@/lib/pagination";
+import { exactSearchFilter, fuzzyShowIds, rankByFuzzyScore } from "@/server/queries/search";
 
 /**
  * Catalogue reads.
@@ -94,18 +95,18 @@ export async function discoverShows(filters: DiscoverFilters) {
   const page = Math.max(1, filters.page ?? 1);
   const sort = filters.sort ?? "popular";
 
-  const where = {
+  // Filters that are not the text query. Shared by both search paths, so a
+  // fuzzy result respects the genre and type the user picked exactly as an
+  // exact one does.
+  const scope = {
     ...(filters.type ? { type: filters.type } : {}),
     ...(filters.airingStatus ? { airingStatus: filters.airingStatus } : {}),
     ...(filters.genre ? { genres: { some: { genre: { slug: filters.genre } } } } : {}),
-    ...(filters.q
-      ? {
-          OR: [
-            { title: { contains: filters.q, mode: "insensitive" as const } },
-            { originalTitle: { contains: filters.q, mode: "insensitive" as const } },
-          ],
-        }
-      : {}),
+  };
+
+  const where = {
+    ...scope,
+    ...(filters.q ? exactSearchFilter(filters.q) : {}),
   };
 
   const [rows, total] = await Promise.all([
@@ -119,12 +120,47 @@ export async function discoverShows(filters: DiscoverFilters) {
     db.show.count({ where }),
   ]);
 
+  // Fuzzy matching runs only when the exact search found nothing at all.
+  //
+  // Two reasons it is a fallback rather than part of the main query. It cannot
+  // use the trigram index, so it is a sequential scan best avoided on the
+  // common path; and blending approximate matches into a result set that
+  // already has real ones would push correct answers down the page to make room
+  // for guesses. Here the alternative on screen is an empty grid.
+  if (filters.q && total === 0) {
+    const matches = await fuzzyShowIds(filters.q);
+
+    if (matches.length > 0) {
+      const fuzzyRows = await db.show.findMany({
+        where: { ...scope, id: { in: matches.map((match) => match.id) } },
+        select: showCardSelect,
+      });
+
+      // Ordered by similarity, not by the sort control: when someone has
+      // mistyped, "did you mean this" beats "most popular of the near misses".
+      const ranked = rankByFuzzyScore(fuzzyRows, matches);
+      const start = (page - 1) * perPage;
+
+      return {
+        shows: ranked.slice(start, start + perPage).map(toShowCard),
+        total: ranked.length,
+        page,
+        perPage,
+        pageCount: Math.max(1, Math.ceil(ranked.length / perPage)),
+        // Lets the page say so, rather than silently showing results for
+        // something the user did not type.
+        didYouMean: ranked.length > 0 ? ranked[0].title : null,
+      };
+    }
+  }
+
   return {
     shows: rows.map(toShowCard),
     total,
     page,
     perPage,
     pageCount: Math.max(1, Math.ceil(total / perPage)),
+    didYouMean: null as string | null,
   };
 }
 
